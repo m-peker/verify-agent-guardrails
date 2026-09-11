@@ -15,7 +15,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from tealtiger.pipeline import DefensePipeline, PipelineConfig, PipelineRequest
+from tealtiger.pipeline import DefensePipeline, PipelineConfig, PipelineHooks, PipelineRequest
 from tealtiger.pipeline.modules.post.content_moderation import (
     ContentModerationConfig,
     ContentModerationModule,
@@ -103,8 +103,38 @@ def build_pipeline(proxy: Any, exclude: Iterable[str] = ()) -> DefensePipeline:
             observe_proxy=proxy,
             agent_id="order-support-01",
             fail_closed=True,
+            hooks=_spend_hooks(controls.get("cost_budget"), proxy),
         )
     )
+
+
+def _spend_hooks(budget: Control | None, proxy: Any) -> PipelineHooks | None:
+    """Keep the budget's session total in step with what the provider has cost.
+
+    CostBudgetModule only knows what it is told: its docs ask the integrator to
+    call add_cost() after every response, and the pipeline does not do it for
+    you. Without this hook the session total stays at $0 forever, and the
+    "session budget" silently becomes a per-request cap.
+
+    The sync runs before each request's budget check and reads the proxy's
+    running total, rather than recording after each call. That way retries the
+    pipeline makes on its own (resampling after a post-execution DENY, which
+    does not fire the after_execution hook) are counted too.
+    """
+    if budget is None:
+        return None
+
+    recorded = 0.0
+
+    def sync_spend(request: Any) -> None:
+        nonlocal recorded
+        cost = proxy.get_cost()
+        total = cost["total_cost"] if isinstance(cost, dict) else cost.total_cost
+        if total > recorded:
+            budget.module.add_cost(total - recorded)
+            recorded = total
+
+    return PipelineHooks(before_pre_execution=sync_spend)
 
 
 # ---------------------------------------------------------------------------
