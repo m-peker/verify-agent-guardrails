@@ -3,7 +3,8 @@ A governed customer-support agent, built on TealTiger's DefensePipeline.
 
 Scenario: an order-support agent for a retail company. It can look up orders.
 It must never issue refunds on its own, never send a customer's national ID or
-IBAN to the model, and never burn more than a few cents per session.
+IBAN to the model, never say something abusive to a customer, and never burn
+more than a few cents per session.
 
 Run:  python agent.py
 No API key required -- the provider is stubbed so the run is deterministic.
@@ -12,8 +13,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any, Iterable
 
 from tealtiger.pipeline import DefensePipeline, PipelineConfig, PipelineRequest
+from tealtiger.pipeline.modules.post.content_moderation import (
+    ContentModerationConfig,
+    ContentModerationModule,
+)
 from tealtiger.pipeline.modules.pre.cost_budget import CostBudgetConfig, CostBudgetModule
 from tealtiger.pipeline.modules.pre.pii_scanner import (
     PIIPattern,
@@ -24,44 +30,76 @@ from tealtiger.pipeline.modules.pre.tool_allowlist import (
     ToolAllowlistConfig,
     ToolAllowlistModule,
 )
-from tealtiger.pipeline.modules.post.content_moderation import (
-    ContentModerationConfig,
-    ContentModerationModule,
-)
 
 # ---------------------------------------------------------------------------
-# 1. What the agent is allowed to touch
+# 1. What the agent is allowed to do
 # ---------------------------------------------------------------------------
 
 ALLOWED_TOOLS = ["get_order_status", "search_orders", "get_shipping_eta"]
 
-# Turkish national ID (11 digits, cannot start with 0) and IBAN.
 PII_PATTERNS = [
+    # Turkish national ID: 11 digits, cannot start with 0.
     PIIPattern("tckn", r"\b[1-9][0-9]{10}\b", 0.90),
+    # Turkish IBAN: TR + 24 digits.
     PIIPattern("iban", r"\bTR\d{24}\b", 0.95),
     PIIPattern("email", r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b", 0.80),
 ]
 
 SESSION_BUDGET_USD = 0.05
+PRICE_PER_TOKEN_USD = 0.000002
 
 
-def build_pipeline(proxy) -> DefensePipeline:
-    """Assemble the three-stage pipeline: pre -> execution -> post."""
+@dataclass(frozen=True)
+class Control:
+    stage: str   # "pre" runs before the provider, "post" inspects its reply
+    module: Any
+
+
+def build_controls() -> dict[str, Control]:
+    """Every governance control this agent runs, by name.
+
+    This is the single source of truth. build_pipeline() assembles the agent
+    from it, and the conformance harness reads the same dict -- so the harness
+    always tests the controls the agent actually ships with, not a copy.
+
+    Returns fresh module instances on every call, because some controls (the
+    cost budget) carry per-session state.
+    """
+    return {
+        "tool_allowlist": Control(
+            "pre", ToolAllowlistModule(ToolAllowlistConfig(allowlist=ALLOWED_TOOLS))
+        ),
+        "pii_scanner": Control(
+            "pre", PIIScannerModule(PIIScannerConfig(threshold=0.5, patterns=PII_PATTERNS))
+        ),
+        "cost_budget": Control(
+            "pre",
+            CostBudgetModule(
+                CostBudgetConfig(
+                    session_budget=SESSION_BUDGET_USD,
+                    cost_per_token=PRICE_PER_TOKEN_USD,
+                )
+            ),
+        ),
+        "content_moderation": Control(
+            "post", ContentModerationModule(ContentModerationConfig())
+        ),
+    }
+
+
+def build_pipeline(proxy: Any, exclude: Iterable[str] = ()) -> DefensePipeline:
+    """Assemble the three-stage pipeline: pre -> execution -> post.
+
+    `exclude` drops named controls. The agent never uses it; the harness does,
+    to prove each denial comes from the control it expects.
+    """
+    excluded = set(exclude)
+    controls = {name: c for name, c in build_controls().items() if name not in excluded}
+
     return DefensePipeline(
         PipelineConfig(
-            pre_execution_modules=[
-                ToolAllowlistModule(ToolAllowlistConfig(allowlist=ALLOWED_TOOLS)),
-                PIIScannerModule(PIIScannerConfig(threshold=0.5, patterns=PII_PATTERNS)),
-                CostBudgetModule(
-                    CostBudgetConfig(
-                        session_budget=SESSION_BUDGET_USD,
-                        cost_per_token=0.000002,
-                    )
-                ),
-            ],
-            post_execution_modules=[
-                ContentModerationModule(ContentModerationConfig()),
-            ],
+            pre_execution_modules=[c.module for c in controls.values() if c.stage == "pre"],
+            post_execution_modules=[c.module for c in controls.values() if c.stage == "post"],
             observe_proxy=proxy,
             agent_id="order-support-01",
             fail_closed=True,
@@ -73,28 +111,39 @@ def build_pipeline(proxy) -> DefensePipeline:
 # 2. A stand-in for an observe()-wrapped provider client
 # ---------------------------------------------------------------------------
 
+DEFAULT_REPLY = "Order 12345 left the warehouse and is with the courier."
+
 
 class StubProxy:
     """Deterministic stand-in for observe(OpenAI()).
 
     A real integration passes the observe() proxy here and gets cost tracking,
     audit logging and behavioural baselines for free. We stub it so this file
-    runs offline and always produces the same output.
+    runs offline and always produces the same output. Like the real proxy, it
+    reports token usage and an accumulated cost.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, reply: str = DEFAULT_REPLY, tokens_per_call: int = 125) -> None:
+        self.reply = reply
+        self.tokens_per_call = tokens_per_call
         self.calls = 0
 
     async def call(self, payload: dict) -> dict:
         self.calls += 1
+        prompt_tokens = self.tokens_per_call // 2
         return {
-            "content": "Order 12345 left the warehouse and is with the courier.",
+            "content": self.reply,
             "model": "gpt-4o-mini",
-            "usage": {"prompt_tokens": 90, "completion_tokens": 35, "total_tokens": 125},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": self.tokens_per_call - prompt_tokens,
+                "total_tokens": self.tokens_per_call,
+            },
         }
 
     def get_cost(self) -> dict:
-        return {"total_cost": 0.00025 * self.calls, "request_count": self.calls}
+        total = self.calls * self.tokens_per_call * PRICE_PER_TOKEN_USD
+        return {"total_cost": total, "request_count": self.calls}
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +170,7 @@ TRAFFIC = [
 ]
 
 
-def render(turn: Turn, result) -> None:
+def render(turn: Turn, result: Any) -> None:
     pre = result.pre_decision
     print(f"  {turn.label}")
     print(f"    tool          : {turn.tool}")
@@ -139,6 +188,7 @@ async def main() -> None:
 
     print("=" * 68)
     print("Governed order-support agent")
+    print(f"  controls        : {', '.join(build_controls())}")
     print(f"  allowlist       : {', '.join(ALLOWED_TOOLS)}")
     print(f"  session budget  : ${SESSION_BUDGET_USD:.2f}")
     print("=" * 68 + "\n")
