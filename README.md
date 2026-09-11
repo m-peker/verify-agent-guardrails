@@ -145,9 +145,9 @@ Delete the PII scanner from the agent entirely, and the coverage check names the
 
 Non-zero exit either way. In CI, a dead control becomes a red build instead of an incident.
 
-## Things this harness found in its own agent
+## Mistakes the first version made
 
-The first version of this repo had the exact failures it warns about. They are fixed, and the git history keeps each one visible:
+The first version of this repo had the exact failures it warns about. A review caught them. The two behavioural ones now have canaries that failed before the fix, and the git history keeps every step visible:
 
 - **The harness tested a copy of the agent.** It rebuilt modules from re-typed configuration, so breaking `agent.py` left it green.
 - **Coverage was circular.** It compared the test's canaries against the test's own list of controls, and missed that content moderation had no canary.
