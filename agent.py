@@ -40,8 +40,9 @@ ALLOWED_TOOLS = ["get_order_status", "search_orders", "get_shipping_eta"]
 PII_PATTERNS = [
     # Turkish national ID: 11 digits, cannot start with 0.
     PIIPattern("tckn", r"\b[1-9][0-9]{10}\b", 0.90),
-    # Turkish IBAN: TR + 24 digits.
-    PIIPattern("iban", r"\bTR\d{24}\b", 0.95),
+    # Turkish IBAN: TR + 24 digits, compact or printed in groups of four,
+    # in any letter case.
+    PIIPattern("iban", r"(?i)\bTR\d{2}(?: ?\d{4}){5} ?\d{2}\b", 0.95),
     PIIPattern("email", r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b", 0.80),
 ]
 

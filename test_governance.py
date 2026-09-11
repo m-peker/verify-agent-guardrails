@@ -79,6 +79,22 @@ CASES = [
                  "content": "Match TR330006100519786457841326 to an order."},
         expect_reason="PII_DETECTED",
     ),
+    # A pattern is only as good as the formats it has been shown. IBANs are
+    # usually printed in groups of four, and people type them in lowercase.
+    Case(
+        control="pii_scanner",
+        name="an IBAN written in groups of four",
+        payload={"tool": "search_orders",
+                 "content": "Refund to TR33 0006 1005 1978 6457 8413 26 please."},
+        expect_reason="PII_DETECTED",
+    ),
+    Case(
+        control="pii_scanner",
+        name="an IBAN typed in lowercase",
+        payload={"tool": "search_orders",
+                 "content": "my iban is tr330006100519786457841326"},
+        expect_reason="PII_DETECTED",
+    ),
     Case(
         control="cost_budget",
         # $0.05 budget / $0.000002 per token = 25,000 tokens. Ask for more.
