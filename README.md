@@ -1,5 +1,7 @@
 # verify-agent-guardrails
 
+[![governance](https://github.com/m-peker/verify-agent-guardrails/actions/workflows/governance.yml/badge.svg)](https://github.com/m-peker/verify-agent-guardrails/actions/workflows/governance.yml)
+
 **Configuring a guardrail and having a guardrail are different things.**
 
 A governance pipeline that returns `ALLOW` tells you one of two things: the control ran and the request was clean, or the control never ran at all. Both produce the same log line. If you only ever send your agent safe traffic, you never find out which one you have.
@@ -14,10 +16,11 @@ Built on [TealTiger](https://github.com/agentguard-ai/tealtiger), an open-source
 
 | File | What it does |
 |---|---|
-| `agent.py` | A governed order-support agent: tool allowlist, input PII scanning, session cost budget |
-| `test_governance.py` | The conformance harness — proves every control denies something |
+| `agent.py` | A governed order-support agent: tool allowlist, input PII scanning, session cost budget, output content moderation |
+| `test_governance.py` | The conformance harness — proves every control the agent ships denies something |
+| `.github/workflows/governance.yml` | Runs the harness on every push |
 
-Both run offline. No API key, no network, deterministic output.
+Both scripts run offline. No API key, no network, deterministic output.
 
 ## Setup
 
@@ -38,7 +41,6 @@ Four requests — one legitimate, three that must be stopped:
   legitimate lookup
     allowed       : True
     pre-exec      : ALLOW []
-    latency       : 1.00 ms
 
   tool outside the allowlist
     allowed       : False
@@ -67,7 +69,7 @@ python test_governance.py        # exits non-zero if any control is not enforcin
 
 ```
   [PASS]  coverage
-          every control has a canary
+          all 4 controls in the agent have a canary
 
   [PASS]  clean traffic
           legitimate request passes
@@ -81,10 +83,22 @@ python test_governance.py        # exits non-zero if any control is not enforcin
   [PASS]  pii_scanner: an IBAN in the prompt
           denied by pii_scanner, allowed without it
 
-  [PASS]  cost_budget: a request that would blow the session budget
+  [PASS]  pii_scanner: an IBAN written in groups of four
+          denied by pii_scanner, allowed without it
+
+  [PASS]  pii_scanner: an IBAN typed in lowercase
+          denied by pii_scanner, allowed without it
+
+  [PASS]  cost_budget: one request larger than the session budget
           denied by cost_budget, allowed without it
 
-  6/6 checks passed (3 controls under test)
+  [PASS]  cost_budget: small requests that add up past the session budget
+          denied by cost_budget, allowed without it
+
+  [PASS]  content_moderation: an abusive reply from the model
+          denied by content_moderation, allowed without it
+
+  10/10 checks passed (4 controls under test)
 ```
 
 ---
@@ -95,18 +109,22 @@ Every control gets two assertions, not one.
 
 **1. Positive** — feed it a payload it must deny, and check the denial carries *that control's own* reason code.
 
-**2. Ablation** — rebuild the pipeline *without* that module, and check the same payload now passes.
+**2. Ablation** — rebuild the pipeline *without* that control, and check the same payload now passes.
 
-The second one is what people skip, and it is what does the work. Without it, a passing test proves only that *something* denied the request. That matters more than it sounds: your PII test can pass for months because the tool allowlist happened to be rejecting that tool anyway — and the day someone legitimately adds the tool to the allowlist, you discover the PII scanner has been dead the whole time.
+The second one is what people skip, and it is what does the work. Without it, a passing test proves only that *something* denied the request. Your PII test can pass for months because the tool allowlist happened to be rejecting that tool anyway — and the day someone legitimately adds the tool to the allowlist, you discover the PII scanner has been dead the whole time.
 
-Two more checks round it out:
+Four rules keep the harness from fooling itself:
 
-- **Clean traffic** must still pass. Governance that blocks everything is also broken; it just fails in a way your users report for you.
-- **Coverage**: every control wired into the pipeline must have a canary. A control with no test is exactly the situation this exercise exists to catch, so the harness audits itself too.
+- **Test the real agent, not a copy.** Controls come from `agent.build_controls()` and pipelines from `agent.build_pipeline()`. A harness that re-types the agent's configuration keeps passing after the agent breaks.
+- **Derive coverage from the agent.** Every control the agent ships must have a canary, and every canary must name a control the agent ships. The list of controls is never hand-written in the test.
+- **Test stateful controls with sequences.** A session budget checked with one oversized request is only proven to be a per-request cap. The canary that matters is five ordinary requests followed by a sixth that must be refused.
+- **Test the formats people use.** A pattern is only proven for the inputs it has been shown. IBANs get canaries for compact, grouped, and lowercase forms.
+
+And one check in the other direction: **clean traffic must still pass.** Governance that blocks everything is also broken; it just fails in a way your users report for you.
 
 ## Does it catch anything?
 
-A test suite that always passes is decoration. Misconfigure the PII scanner so no pattern can reach its threshold — `threshold=0.99` when the highest-confidence pattern is `0.95` — and the scanner loads fine, reports healthy, and never fires again:
+A test suite that always passes is decoration. Break the agent — not the test — by setting the PII scanner's threshold in `agent.py` to `0.99`, where no pattern can reach:
 
 ```
   [FAIL]  pii_scanner: a national ID in the prompt
@@ -114,22 +132,43 @@ A test suite that always passes is decoration. Misconfigure the PII scanner so n
 
   [FAIL]  pii_scanner: an IBAN in the prompt
           full pipeline ALLOWED a payload that must be denied
-
-  4/6 checks passed (3 controls under test)
-  A FAIL here means a control is configured but not enforcing.
+  ...
+  6/10 checks passed (4 controls under test)
 ```
 
-Non-zero exit. In CI, a dead control becomes a red build instead of an incident.
+Delete the PII scanner from the agent entirely, and the coverage check names the problem on the first line:
+
+```
+  [FAIL]  coverage
+          canary for a control the agent does not ship: pii_scanner
+```
+
+Non-zero exit either way. In CI, a dead control becomes a red build instead of an incident.
+
+## Things this harness found in its own agent
+
+The first version of this repo had the exact failures it warns about. They are fixed, and the git history keeps each one visible:
+
+- **The harness tested a copy of the agent.** It rebuilt modules from re-typed configuration, so breaking `agent.py` left it green.
+- **Coverage was circular.** It compared the test's canaries against the test's own list of controls, and missed that content moderation had no canary.
+- **The session budget never accumulated.** `CostBudgetModule` only counts spend reported through `add_cost()`, and the pipeline does not call it. Without that wiring the "session" budget was a per-request cap. `agent.py` now syncs spend from the provider proxy before every budget check.
+- **Grouped and lowercase IBANs were not detected.**
+
+## Known limitations
+
+This is a demonstration of a testing method, not a production PII detector.
+
+- **The national ID pattern has no checksum.** Any 11-digit number that does not start with 0 matches, so an order number such as `20240912345` is a false positive. A real deployment should validate the TCKN checksum, which a regex cannot express.
+- **National IDs written with spaces are not detected.** Allowing spaces would also match fragments of phone numbers.
+- **The IBAN pattern does not verify the mod-97 check digits.**
+- **The provider is a stub.** It reports usage and cost the way an `observe()`-wrapped client does, but no real model is called.
 
 ## Adapting this to your own stack
 
-The harness is deliberately small — around 150 lines — because the point is the shape, not the code. To port it:
-
-1. List the controls your pipeline actually loads.
-2. For each, write one payload it must reject and name the reason code only it emits.
+1. Expose the controls your agent actually runs from one place, and build the agent from it.
+2. For each control, write a payload it must reject and name the reason code only it emits. Add format variants for pattern-based controls and request sequences for stateful ones.
 3. Assert the denial, then assert the payload passes with that control removed.
-4. Add a clean-traffic case and a coverage check.
-5. Run it in CI.
+4. Derive coverage from the agent, add a clean-traffic case, and run it in CI.
 
 The question worth being able to answer, whatever you use: *when did this control last say no, and can I make it say no on demand?*
 

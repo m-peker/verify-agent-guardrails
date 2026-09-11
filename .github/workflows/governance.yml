@@ -1,0 +1,20 @@
+name: governance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run the agent
+        run: python agent.py
+      - name: Prove every control is enforcing
+        run: python test_governance.py
