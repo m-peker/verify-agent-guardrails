@@ -176,7 +176,7 @@ The question worth being able to answer, whatever you use: *when did this contro
 
 ## Writeup
 
-Accompanies the article *"ALLOW Is Not a Safety Signal"* — link to follow.
+Accompanies the article **[Testing AI Agent Guardrails: Why ALLOW Is Not a Safety Signal](https://medium.com/@msapeker/testing-ai-agent-guardrails-why-allow-is-not-a-safety-signal-0a76cf0301b3)**, which walks through the agent, the method, and the mistakes the first version of this repo made.
 
 ## License
 
